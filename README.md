@@ -2073,6 +2073,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
 Explicación:
 
 Logging rotativo: Archivos de log con rotación
@@ -2084,3 +2086,804 @@ Timeout: Límite de tiempo para operaciones
 Estructura de proyecto: Organización profesional
 
 Scheduler: Programación de ejecuciones (Windows/Linux)
+
+🎯 MÓDULO 8: PROYECTO INTEGRADOR
+Proyecto: Procesamiento Automático de Facturas
+python
+# modulo8_proyecto_integrador.py
+"""
+PROYECTO INTEGRADOR - PROCESAMIENTO DE FACTURAS
+Automatización completa: leer PDFs, extraer datos, cargar a web, generar reporte, enviar correo
+"""
+
+import os
+import re
+import time
+import json
+import shutil
+import logging
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+from functools import wraps
+
+import pandas as pd
+import PyPDF2
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+# Importar módulos de los ejercicios anteriores
+from modulo4_selenium_automation import RobotWebAutomation
+from modulo6_correos_api import CorreoSMTP, generar_reporte_clima_html
+from modulo7_buenas_practicas import setup_logging, retry, ProyectoRPA
+
+# ============================================================
+# ESTRUCTURA DE DATOS
+# ============================================================
+
+@dataclass
+class Factura:
+    """Clase para representar una factura"""
+    numero: str
+    fecha: str
+    proveedor: str
+    monto: float
+    moneda: str = "USD"
+    archivo_original: str = ""
+    validada: bool = False
+    
+    def validar(self) -> bool:
+        """Valida los datos de la factura"""
+        # Validar fecha formato DD/MM/YYYY o YYYY-MM-DD
+        patron_fecha = r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$|^\d{4}-\d{2}-\d{2}$'
+        if not re.match(patron_fecha, self.fecha):
+            logging.warning(f"Fecha inválida: {self.fecha}")
+            return False
+        
+        # Validar monto positivo
+        if self.monto <= 0:
+            logging.warning(f"Monto inválido: {self.monto}")
+            return False
+        
+        # Validar número de factura no vacío
+        if not self.numero or len(self.numero) < 3:
+            logging.warning(f"Número de factura inválido: {self.numero}")
+            return False
+        
+        self.validada = True
+        return True
+
+# ============================================================
+# SCRIPT 1: EXTRACTOR DE PDFs
+# ============================================================
+
+class ExtractorFacturas:
+    """Extrae información de facturas desde archivos PDF"""
+    
+    # Patrones comunes en facturas
+    PATRONES = {
+        'numero': [
+            r'(?:FACTURA|INVOICE|N[°º]?|Número|No\.?)\s*[:\-]?\s*([A-Z0-9\-]{5,})',
+            r'(?:FOLIO|REFERENCIA)\s*[:\-]?\s*([A-Z0-9\-]{5,})',
+            r'INV[-_]?\d{4,}',
+            r'F[-_]?\d{6,}'
+        ],
+        'fecha': [
+            r'(?:FECHA|DATE)\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+            r'(\d{4}-\d{2}-\d{2})',
+            r'(\d{1,2}\s+(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+\d{4})'
+        ],
+        'proveedor': [
+            r'(?:PROVEEDOR|SUPPLIER|VENDEDOR|EMPRESA)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ\s]{3,})',
+            r'(?:NOMBRE|NAME)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ\s]{3,})'
+        ],
+        'monto': [
+            r'(?:TOTAL|SUBTOTAL|IMPORTE)\s*[:\-]?\s*[\$]?\s*([\d,]+\.?\d*)',
+            r'MONTO\s*[:\-]?\s*[\$]?\s*([\d,]+\.?\d*)',
+            r'[\$]\s*([\d,]+\.?\d*)\s*(?:USD|MXN|EUR)?'
+        ]
+    }
+    
+    def __init__(self, directorio_pdfs: str = "data/facturas"):
+        self.directorio = Path(directorio_pdfs)
+        self.procesados_dir = Path("data/procesados")
+        self.errores_dir = Path("data/errores")
+        self.facturas: List[Factura] = []
+        
+        # Crear directorios
+        self.directorio.mkdir(parents=True, exist_ok=True)
+        self.procesados_dir.mkdir(parents=True, exist_ok=True)
+        self.errores_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Configurar logging
+        self.logger = logging.getLogger(__name__)
+    
+    def extraer_texto_pypdf2(self, ruta_pdf: Path) -> str:
+        """Extrae texto usando PyPDF2 (rápido, pero puede fallar con PDFs escaneados)"""
+        texto = []
+        with open(ruta_pdf, 'rb') as archivo:
+            lector = PyPDF2.PdfReader(archivo)
+            for pagina in lector.pages:
+                texto_pagina = pagina.extract_text()
+                if texto_pagina:
+                    texto.append(texto_pagina)
+        return "\n".join(texto)
+    
+    def extraer_texto_pdfplumber(self, ruta_pdf: Path) -> str:
+        """Extrae texto usando pdfplumber (mejor calidad, más lento)"""
+        texto = []
+        with pdfplumber.open(ruta_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto_pagina = pagina.extract_text()
+                if texto_pagina:
+                    texto.append(texto_pagina)
+                
+                # Extraer tablas si existen
+                tablas = pagina.extract_tables()
+                for tabla in tablas:
+                    if tabla:
+                        for fila in tabla:
+                            if fila and any(fila):
+                                texto.append(" ".join(str(c) for c in fila if c)))
+        return "\n".join(texto)
+    
+    def extraer_datos_factura(self, ruta_pdf: Path) -> Optional[Dict]:
+        """Extrae datos de una factura usando múltiples métodos"""
+        self.logger.info(f"📄 Extrayendo datos de: {ruta_pdf.name}")
+        
+        # Intentar extraer texto
+        texto = self.extraer_texto_pdfplumber(ruta_pdf)
+        if not texto:
+            texto = self.extraer_texto_pypdf2(ruta_pdf)
+        
+        if not texto:
+            self.logger.warning(f"❌ No se pudo extraer texto de {ruta_pdf.name}")
+            return None
+        
+        # Buscar datos usando patrones
+        datos = {}
+        
+        for campo, patrones in self.PATRONES.items():
+            for patron in patrones:
+                match = re.search(patron, texto, re.IGNORECASE)
+                if match:
+                    valor = match.group(1).strip()
+                    if campo == 'monto':
+                        # Limpiar formato de monto
+                        valor = float(valor.replace(',', ''))
+                    datos[campo] = valor
+                    break
+        
+        # Limpiar proveedor (eliminar caracteres extraños)
+        if 'proveedor' in datos:
+            proveedor = datos['proveedor']
+            proveedor = re.sub(r'[^A-ZÁÉÍÓÚÑ\s]', '', proveedor).strip()
+            datos['proveedor'] = proveedor[:50]  # Limitar longitud
+        
+        return datos
+    
+    @retry(max_retries=2, delay=1)
+    def procesar_pdf(self, ruta_pdf: Path) -> Optional[Factura]:
+        """Procesa un archivo PDF y retorna una Factura"""
+        try:
+            datos = self.extraer_datos_factura(ruta_pdf)
+            
+            if not datos:
+                raise ValueError(f"No se pudieron extraer datos")
+            
+            # Crear factura
+            factura = Factura(
+                numero=datos.get('numero', f"UNKNOWN_{datetime.now().strftime('%Y%m%d%H%M%S')}"),
+                fecha=datos.get('fecha', datetime.now().strftime("%d/%m/%Y")),
+                proveedor=datos.get('proveedor', "DESCONOCIDO"),
+                monto=datos.get('monto', 0.0),
+                archivo_original=str(ruta_pdf)
+            )
+            
+            # Validar
+            if not factura.validar():
+                self.logger.warning(f"Factura no válida: {factura}")
+                # Mover a errores
+                shutil.move(str(ruta_pdf), self.errores_dir / ruta_pdf.name)
+                return None
+            
+            self.logger.info(f"✅ Factura extraída: {factura.numero} - {factura.proveedor} - ${factura.monto}")
+            
+            # Mover a procesados
+            shutil.move(str(ruta_pdf), self.procesados_dir / ruta_pdf.name)
+            
+            return factura
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error procesando {ruta_pdf.name}: {e}")
+            shutil.move(str(ruta_pdf), self.errores_dir / ruta_pdf.name)
+            return None
+    
+    def procesar_todas(self) -> List[Factura]:
+        """Procesa todos los PDFs en el directorio"""
+        pdfs = list(self.directorio.glob("*.pdf"))
+        
+        if not pdfs:
+            self.logger.warning(f"No se encontraron PDFs en {self.directorio}")
+            return []
+        
+        self.logger.info(f"🔄 Procesando {len(pdfs)} facturas...")
+        
+        for pdf in pdfs:
+            factura = self.procesar_pdf(pdf)
+            if factura:
+                self.facturas.append(factura)
+        
+        self.logger.info(f"✅ Procesadas {len(self.facturas)} facturas válidas")
+        return self.facturas
+
+# ============================================================
+# SCRIPT 2: GENERADOR DE REPORTE EXCEL
+# ============================================================
+
+class GeneradorReporte:
+    """Genera reportes Excel con resumen de facturas"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def generar_reporte_excel(self, facturas: List[Factura], ruta_salida: str = "data/reporte_facturas.xlsx"):
+        """Genera un reporte Excel con formato profesional"""
+        
+        # Convertir a DataFrame
+        datos = [asdict(f) for f in facturas]
+        df = pd.DataFrame(datos)
+        
+        # Crear Excel con múltiples hojas
+        with pd.ExcelWriter(ruta_salida, engine='openpyxl') as writer:
+            # Hoja 1: Detalle de facturas
+            df.to_excel(writer, sheet_name='Detalle Facturas', index=False)
+            
+            # Hoja 2: Resumen por proveedor
+            resumen_proveedor = df.groupby('proveedor').agg({
+                'monto': ['sum', 'count', 'mean']
+            }).round(2)
+            resumen_proveedor.columns = ['Total', 'Cantidad', 'Promedio']
+            resumen_proveedor.to_excel(writer, sheet_name='Resumen Proveedor')
+            
+            # Hoja 3: Métricas generales
+            metricas = pd.DataFrame([
+                ['Total Facturas', len(facturas)],
+                ['Total Monto', f"${df['monto'].sum():,.2f}"],
+                ['Monto Promedio', f"${df['monto'].mean():,.2f}"],
+                ['Monto Máximo', f"${df['monto'].max():,.2f}"],
+                ['Monto Mínimo', f"${df['monto'].min():,.2f}"],
+                ['Fecha Procesamiento', datetime.now().strftime("%d/%m/%Y %H:%M")],
+                ['Proveedores Únicos', df['proveedor'].nunique()]
+            ], columns=['Métrica', 'Valor'])
+            metricas.to_excel(writer, sheet_name='Métricas', index=False)
+            
+            # Formatear el archivo Excel
+            self._formatear_excel(ruta_salida)
+        
+        self.logger.info(f"📊 Reporte Excel generado: {ruta_salida}")
+        return ruta_salida
+    
+    def _formatear_excel(self, ruta_archivo):
+        """Aplica formato profesional al Excel"""
+        from openpyxl import load_workbook
+        
+        wb = load_workbook(ruta_archivo)
+        
+        # Estilos
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+        
+        for hoja in wb.worksheets:
+            # Formatear cabeceras
+            for celda in hoja[1]:
+                celda.font = header_font
+                celda.fill = header_fill
+                celda.alignment = Alignment(horizontal="center")
+            
+            # Ajustar ancho de columnas
+            for columna in hoja.columns:
+                max_length = 0
+                col_letter = columna[0].column_letter
+                for celda in columna:
+                    try:
+                        if len(str(celda.value)) > max_length:
+                            max_length = len(str(celda.value))
+                    except:
+                        pass
+                hoja.column_dimensions[col_letter].width = min(max_length + 2, 30)
+        
+        wb.save(ruta_archivo)
+
+# ============================================================
+# SCRIPT 3: CARGADOR WEB
+# ============================================================
+
+class CargadorWebFacturas:
+    """Carga facturas a un sistema web (demo)"""
+    
+    def __init__(self, headless=False):
+        self.logger = logging.getLogger(__name__)
+        self.robot_web = RobotWebAutomation(headless=headless)
+        self.cargas_exitosas = 0
+        self.cargas_fallidas = []
+    
+    def login_sistema_demo(self):
+        """Login al sistema de demostración"""
+        # Usar sitio de pruebas público
+        self.robot_web.navegar_a_sitio("https://the-internet.herokuapp.com/login")
+        
+        return self.robot_web.login(
+            username="tomsmith",
+            password="SuperSecretPassword!",
+            username_selector="#username",
+            password_selector="#password",
+            submit_selector="button[type='submit']"
+        )
+    
+    def cargar_factura(self, factura: Factura) -> bool:
+        """
+        Carga una factura al sistema web
+        En un caso real, aquí iría la lógica específica del sistema
+        """
+        try:
+            self.logger.info(f"🌐 Cargando factura: {factura.numero}")
+            
+            # Demo: Simular carga exitosa
+            # En producción, usar selectores reales:
+            # self.robot_web.interactuar_con_formulario({
+            #     "#numero_factura": factura.numero,
+            #     "#fecha": factura.fecha,
+            #     "#proveedor": factura.proveedor,
+            #     "#monto": str(factura.monto)
+            # }, "#btn_guardar")
+            
+            # Simular éxito
+            time.sleep(0.5)
+            self.cargas_exitosas += 1
+            self.logger.info(f"✅ Factura {factura.numero} cargada exitosamente")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error cargando factura {factura.numero}: {e}")
+            self.cargas_fallidas.append(factura)
+            return False
+    
+    def cargar_todas(self, facturas: List[Factura]) -> Dict:
+        """Carga todas las facturas al sistema"""
+        self.logger.info(f"🚀 Iniciando carga de {len(facturas)} facturas...")
+        
+        try:
+            if not self.login_sistema_demo():
+                self.logger.error("❌ No se pudo iniciar sesión")
+                return {'exitosas': 0, 'fallidas': len(facturas), 'detalle': []}
+            
+            for factura in facturas:
+                self.cargar_factura(factura)
+            
+        finally:
+            self.robot_web.cerrar()
+        
+        return {
+            'exitosas': self.cargas_exitosas,
+            'fallidas': len(self.cargas_fallidas),
+            'detalle': self.cargas_fallidas
+        }
+
+# ============================================================
+# SCRIPT 4: ENVIADOR DE CORREO
+# ============================================================
+
+class EnviadorReporte:
+    """Envía el reporte por correo electrónico"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.correo = CorreoSMTP()
+    
+    def generar_cuerpo_html(self, facturas: List[Factura], estadisticas: Dict) -> str:
+        """Genera el cuerpo HTML del correo"""
+        
+        total_monto = sum(f.monto for f in facturas)
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .container {{ max-width: 800px; margin: 0 auto; padding: 20px; }}
+                h1 {{ color: #2E75B6; }}
+                .metricas {{ background: #f0f0f0; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .exito {{ color: green; font-weight: bold; }}
+                .error {{ color: red; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #2E75B6; color: white; }}
+                tr:nth-child(even) {{ background-color: #f2f2f2; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📄 Reporte de Procesamiento de Facturas</h1>
+                <p><strong>Fecha de generación:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+                
+                <div class="metricas">
+                    <h2>📊 Estadísticas</h2>
+                    <p>✅ Facturas procesadas: {len(facturas)}</p>
+                    <p>💰 Monto total: ${total_monto:,.2f}</p>
+                    <p>📈 Monto promedio: ${(total_monto/len(facturas)) if facturas else 0:,.2f}</p>
+                    <p>🏢 Proveedores distintos: {len(set(f.proveedor for f in facturas))}</p>
+                </div>
+                
+                <h2>📋 Detalle de Facturas</h2>
+                <table>
+                    <thead>
+                        <tr><th>Número</th><th>Fecha</th><th>Proveedor</th><th>Monto</th><th>Validada</th></tr>
+                    </thead>
+                    <tbody>
+        """
+        
+        for factura in facturas:
+            html += f"""
+                        <tr>
+                            <td>{factura.numero}</td>
+                            <td>{factura.fecha}</td>
+                            <td>{factura.proveedor}</td>
+                            <td>${factura.monto:,.2f}</td>
+                            <td class="exito">✓</td>
+                        </tr>
+            """
+        
+        html += f"""
+                    </tbody>
+                </table>
+                
+                <hr>
+                <p style="font-size: 0.8em; color: #666; text-align: center;">
+                    Reporte generado automáticamente por el Robot RPA 2026<br>
+                    Proyecto Integrador - Automatización Inteligente
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+    
+    def enviar(self, facturas: List[Factura], ruta_excel: str, destinatarios: List[str]):
+        """Envía el reporte por correo"""
+        
+        estadisticas = {
+            'total': len(facturas),
+            'monto_total': sum(f.monto for f in facturas)
+        }
+        
+        cuerpo_html = self.generar_cuerpo_html(facturas, estadisticas)
+        
+        return self.correo.enviar_correo(
+            destino=destinatarios,
+            asunto=f"📊 Reporte Facturas - {datetime.now().strftime('%d/%m/%Y')}",
+            cuerpo_html=cuerpo_html,
+            adjuntos=[ruta_excel] if os.path.exists(ruta_excel) else None
+        )
+
+# ============================================================
+# ORQUESTADOR PRINCIPAL
+# ============================================================
+
+class ProcesadorFacturasOrquestador:
+    """Orquesta todo el proceso de automatización"""
+    
+    def __init__(self):
+        self.logger = setup_logging("proyecto_integrador", logging.INFO)
+        self.extractor = ExtractorFacturas()
+        self.generador = GeneradorReporte()
+        self.enviador = EnviadorReporte()
+        self.cargador = None  # Inicializar solo si se necesita
+        
+        self.facturas = []
+        self.config = self._cargar_config()
+    
+    def _cargar_config(self):
+        """Carga configuración"""
+        return {
+            'generar_reporte': True,
+            'enviar_correo': True,
+            'cargar_web': False,  # Desactivado por defecto (requiere credenciales)
+            'destinatarios': ['reportes@ejemplo.com', 'admin@ejemplo.com']
+        }
+    
+    def paso_1_extraer_pdfs(self):
+        """Paso 1: Extraer datos de PDFs"""
+        self.logger.info("="*60)
+        self.logger.info("PASO 1: Extrayendo facturas de PDFs")
+        self.logger.info("="*60)
+        
+        self.facturas = self.extractor.procesar_todas()
+        
+        if not self.facturas:
+            self.logger.warning("⚠️ No se encontraron facturas válidas")
+            return False
+        
+        self.logger.info(f"✅ Extraídas {len(self.facturas)} facturas")
+        return True
+    
+    def paso_2_validar_datos(self):
+        """Paso 2: Validar datos extraídos"""
+        self.logger.info("\n" + "="*60)
+        self.logger.info("PASO 2: Validando datos")
+        self.logger.info("="*60)
+        
+        facturas_validas = [f for f in self.facturas if f.validar() if f.monto > 0]
+        
+        if len(facturas_validas) != len(self.facturas):
+            self.logger.warning(f"{len(self.facturas) - len(facturas_validas)} facturas inválidas")
+            self.facturas = facturas_validas
+        
+        # Mostrar resumen
+        for factura in self.facturas:
+            self.logger.info(f"  • {factura.numero} | {factura.proveedor} | ${factura.monto:,.2f}")
+        
+        return True
+    
+    def paso_3_generar_reporte(self):
+        """Paso 3: Generar reporte Excel"""
+        if not self.config['generar_reporte']:
+            self.logger.info("⏭️ Omitiendo generación de reporte")
+            return None
+        
+        self.logger.info("\n" + "="*60)
+        self.logger.info("PASO 3: Generando reporte Excel")
+        self.logger.info("="*60)
+        
+        ruta_excel = self.generador.generar_reporte_excel(self.facturas)
+        self.logger.info(f"✅ Reporte generado: {ruta_excel}")
+        
+        return ruta_excel
+    
+    def paso_4_cargar_web(self):
+        """Paso 4: Cargar facturas a sistema web"""
+        if not self.config['cargar_web']:
+            self.logger.info("⏭️ Omitiendo carga web (desactivada en configuración)")
+            return None
+        
+        self.logger.info("\n" + "="*60)
+        self.logger.info("PASO 4: Cargando facturas al sistema web")
+        self.logger.info("="*60)
+        
+        self.cargador = CargadorWebFacturas(headless=True)
+        resultado = self.cargador.cargar_todas(self.facturas)
+        
+        self.logger.info(f"✅ Carga completada: {resultado['exitosas']} éxitos, {resultado['fallidas']} fallos")
+        return resultado
+    
+    def paso_5_enviar_correo(self, ruta_excel: str = None):
+        """Paso 5: Enviar reporte por correo"""
+        if not self.config['enviar_correo']:
+            self.logger.info("⏭️ Omitiendo envío de correo")
+            return None
+        
+        self.logger.info("\n" + "="*60)
+        self.logger.info("PASO 5: Enviando reporte por correo")
+        self.logger.info("="*60)
+        
+        resultado = self.enviador.enviar(
+            self.facturas,
+            ruta_excel or "data/reporte_facturas.xlsx",
+            self.config['destinatarios']
+        )
+        
+        if resultado:
+            self.logger.info("✅ Correo enviado exitosamente")
+        else:
+            self.logger.warning("⚠️ Correo guardado localmente (sin credenciales)")
+        
+        return resultado
+    
+    def ejecutar(self):
+        """Ejecuta el flujo completo"""
+        self.logger.info("🚀 INICIANDO PROYECTO INTEGRADOR - PROCESAMIENTO DE FACTURAS")
+        self.logger.info("="*60)
+        
+        try:
+            # Paso 1: Extraer PDFs
+            if not self.paso_1_extraer_pdfs():
+                self.logger.error("❌ No se pudieron extraer facturas")
+                return False
+            
+            # Paso 2: Validar datos
+            self.paso_2_validar_datos()
+            
+            # Paso 3: Generar reporte
+            ruta_excel = self.paso_3_generar_reporte()
+            
+            # Paso 4: Cargar a web (opcional)
+            self.paso_4_cargar_web()
+            
+            # Paso 5: Enviar correo
+            self.paso_5_enviar_correo(ruta_excel)
+            
+            # Resumen final
+            self.logger.info("\n" + "="*60)
+            self.logger.info("🎉 PROYECTO COMPLETADO EXITOSAMENTE")
+            self.logger.info("="*60)
+            self.logger.info(f"📄 Facturas procesadas: {len(self.facturas)}")
+            self.logger.info(f"💰 Monto total: ${sum(f.monto for f in self.facturas):,.2f}")
+            self.logger.info(f"📊 Reporte Excel: {ruta_excel}")
+            self.logger.info(f"📁 PDFs originales: {self.extractor.directorio}")
+            self.logger.info(f"✅ PDFs procesados: {self.extractor.procesados_dir}")
+            self.logger.info(f"❌ PDFs con error: {self.extractor.errores_dir}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.critical(f"❌ Error fatal en el proceso: {e}", exc_info=True)
+            return False
+
+# ============================================================
+# FUNCIONES DE DEMO Y PREPARACIÓN
+# ============================================================
+
+def crear_pdfs_ejemplo():
+    """Crea PDFs de ejemplo para demostración"""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    
+    os.makedirs("data/facturas", exist_ok=True)
+    
+    facturas_ejemplo = [
+        {
+            'numero': 'FAC-2026-001',
+            'fecha': '15/01/2026',
+            'proveedor': 'TECH SUPPLIES S.A.',
+            'monto': 1250.50
+        },
+        {
+            'numero': 'INV-2026-002',
+            'fecha': '20/01/2026',
+            'proveedor': 'LOGISTICA EXPRESS',
+            'monto': 3400.00
+        },
+        {
+            'numero': 'F-2026003',
+            'fecha': '25/01/2026',
+            'proveedor': 'SERVICIOS GENERALES',
+            'monto': 875.75
+        }
+    ]
+    
+    for factura in facturas_ejemplo:
+        ruta = f"data/facturas/factura_{factura['numero']}.pdf"
+        
+        doc = SimpleDocTemplate(ruta, pagesize=letter)
+        elementos = []
+        estilos = getSampleStyleSheet()
+        
+        # Título
+        titulo = Paragraph("FACTURA", estilos['Title'])
+        elementos.append(titulo)
+        elementos.append(Spacer(1, 12))
+        
+        # Datos
+        datos = [
+            ["Número:", factura['numero']],
+            ["Fecha:", factura['fecha']],
+            ["Proveedor:", factura['proveedor']],
+            ["Total:", f"${factura['monto']:.2f}"]
+        ]
+        
+        tabla = Table(datos)
+        tabla.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        elementos.append(tabla)
+        
+        doc.build(elementos)
+        print(f"📄 Creado PDF de ejemplo: {ruta}")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    """Función principal"""
+    print("\n" + "="*70)
+    print("🏆 PROYECTO INTEGRADOR - PROCESAMIENTO AUTOMÁTICO DE FACTURAS")
+    print("="*70)
+    print("Este proyecto implementa un robot RPA completo que:")
+    print("  1. Lee facturas desde PDFs")
+    print("  2. Extrae información automáticamente")
+    print("  3. Valida los datos extraídos")
+    print("  4. Genera reportes en Excel")
+    print("  5. Envía reportes por correo")
+    print("  6. Maneja errores y logs")
+    print("="*70)
+    
+    # Crear PDFs de ejemplo si no existen
+    if not list(Path("data/facturas").glob("*.pdf")):
+        print("\n📝 Creando PDFs de ejemplo...")
+        crear_pdfs_ejemplo()
+    
+    # Ejecutar el orquestador
+    orquestador = ProcesadorFacturasOrquestador()
+    exitoso = orquestador.ejecutar()
+    
+    if exitoso:
+        print("\n🎉 ¡PROYECTO COMPLETADO CON ÉXITO!")
+        print("📋 Revisar:")
+        print("   • data/reporte_facturas.xlsx - Reporte generado")
+        print("   • logs/proyecto_integrador.log - Log de ejecución")
+        print("   • data/procesados/ - Facturas procesadas")
+        print("   • data/errores/ - Facturas con errores (si las hay)")
+    else:
+        print("\n❌ El proyecto no se completó correctamente")
+        print("🔍 Revisar el log para más detalles")
+
+if __name__ == "__main__":
+    main()
+Explicación del Proyecto Integrador:
+
+Este proyecto completo implementa:
+
+Extractor de PDFs (Script 1): Busca archivos PDF, extrae información usando múltiples métodos, valida datos y organiza archivos procesados/errores.
+
+Generador de Reportes (Script 3): Crea reportes Excel profesionales con múltiples hojas (detalle, resumen por proveedor, métricas).
+
+Cargador Web (Script 2): Sube datos a sistemas web (simulado para demo).
+
+Enviador de Correo (Script 4): Genera correos HTML con adjuntos.
+
+Orquestador: Coordina todo el flujo con manejo de errores y logging.
+
+📋 REQUISITOS
+txt
+# requirements.txt - Instalar con pip install -r requirements.txt
+
+# Core
+pyautogui>=0.9.54
+selenium>=4.15.0
+webdriver-manager>=4.0.1
+
+# Procesamiento datos
+pandas>=2.1.0
+openpyxl>=3.1.2
+PyPDF2>=3.0.1
+pdfplumber>=0.10.3
+
+# Correos y APIs
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Reportes (opcional)
+reportlab>=4.0.4
+
+# Utilidades
+pyperclip>=1.8.2
+pillow>=10.1.0
+🎓 CONCLUSIÓN
+Este código completo cubre todos los ejercicios del curso desde el Módulo 0 al Módulo 8, incluyendo:
+
+✅ M0: Primer robot con pyautogui
+
+✅ M1: Procesador de CSV con validaciones
+
+✅ M2: Reporte automático en Bloc de Notas
+
+✅ M4: Automatización web completa con Selenium
+
+✅ M5: Procesador avanzado de Excel y PDFs
+
+✅ M6: API de clima + envío de correos
+
+✅ M7: Logging, reintentos, timeouts, estructura profesional
+
+✅ M8: Proyecto Integrador completo de facturas
+
