@@ -2,11 +2,12 @@
 Python + RPA
 
 📁 ESTRUCTURA DEL PROYECTO
+```python
 text
 rpa_curso_2026/
 ├── config/
 │   └── config.env
-├── data/
+├── data/Abrir Bloc de
 │   ├── ventas.xlsx
 │   ├── facturas/
 │   └── procesados/
@@ -15,6 +16,7 @@ rpa_curso_2026/
 ├── utils/
 ├── main.py
 └── requirements.txt
+```
 🔧 MÓDULO 0: INTRODUCCIÓN Y SETUP
 Ejercicio: Primer Robot RPA - "Hola Mundo" con Bloc de Notas
 python
